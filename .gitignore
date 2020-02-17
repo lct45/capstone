@@ -1,0 +1,5 @@
+#ignore secret keys
+secret.yaml
+
+#config files
+.vscode
