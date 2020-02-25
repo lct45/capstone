@@ -6,6 +6,7 @@ import string
 from praw.models import MoreComments
 import re
 from textblob import TextBlob
+from textblob.classifiers import NaiveBayesClassifier
 
 
 master_posts = { 
@@ -19,12 +20,17 @@ master_posts = {
     }
 master_comments = { 
     "id":[], 
+    'post_id':[],
     'parent_id': [],
+    'post_topic':[],
     "comms_num": [],
     "body":[],
     "sentiment": []
     }
 
+negList=[]
+posList=[]
+accuracyList=[]
 
 with open("secret.yaml") as secretFile:
     secretDict = yaml.load(secretFile, Loader=yaml.BaseLoader)
@@ -63,22 +69,32 @@ def searchAdd(queries, subreddit):
 
 def processcomments(reddit, posts_df):
     #process all the individual ids and pull their comments
-    for ident in posts_df['id']:
+    posts_df.insert(3, 'deleted comms', 0)
+    posts_df.insert(3, 'top level comms', 0)
+    posts_df.insert(3, 'nested comms', 0)
+    for ident in posts_df.index:
         submission = reddit.submission(id=ident)
         #only pull top level comments, not replies to replies for now
         submission.comments.replace_more(limit=None)
         counter = 0
+        topcounter = 0
+        topic = posts_df.at[ident, 'topic']
         for comment in submission.comments.list():        
             #need to make sure its not picking up comments from OP
             counter +=1
+            if 't3_' in comment.parent_id:
+                topcounter +=1
             if comment.is_submitter == False and comment.body != '[removed]' and comment.body != '[deleted]':
-                master_comments['parent_id'].append(comment.parent_id)
                 master_comments['id'].append(comment.id)
+                master_comments['post_id'].append(ident)
+                master_comments['parent_id'].append(comment.parent_id)
+                master_comments['post_topic'].append(topic)
                 master_comments['comms_num'].append(submission.num_comments)
                 master_comments['body'].append(normalizeText(comment.body))
                 master_comments['sentiment'].append('blank')
-
-
+        posts_df.at[ident, 'deleted comms'] = submission.num_comments-counter
+        posts_df.at[ident, 'top level comms'] = topcounter
+        posts_df.at[ident, 'nested comms'] = counter-topcounter
 
 
 def searches(subreddit):
@@ -106,29 +122,149 @@ def searches(subreddit):
     searchAdd('gender fluid', subreddit)
     searchAdd('gender queer', subreddit)
 
-def evaluation(df):
-    correct = 0
-    incorrect = 0
+def evaluation(df, col):
+    tp = 0
+    tn = 0
+    fp = 0
+    fn = 0
     for index in df.index:
-        if df.at[index, 'new sent'] == df.at[index, 'sentiment']:
-            correct += 1
+        if df.at[index, col] == df.at[index, 'sentiment']:
+            if df.at[index, col] == 'positive':
+                tp += 1
+            else:
+                tn += 1
         else:
-            incorrect += 1
-    print('the number of correctly evaluated posts is {}'.format(correct))
-    print('the number of incorrect posts is {}'.format(incorrect))
-    print('out of {}, we correctly classified {}'.format(len(df.index), correct/(len(df.index))))
+            if df.at[index, col] == 'positive':
+                fp += 1
+            else:
+                fn += 1
+    total = len(df.index)
+    print('the number of correctly evaluated posts is {}'.format(tp+tn))
+    print('the number of incorrect posts is {}'.format(fp+fn))
+    #print('the number of true positive  is {}'.format(tp))
+    #print('the number of true negative  is {}'.format(tn))
+    #print('the number of false positive  is {}'.format(fp))
+    #print('the number of false negative  is {}'.format(fn))
+    print('supposed to have {} positive but have {} positive'.format((tp+fn), (tp+fp)))
+    print('supposed to have {} negative but have {} negative'.format((tn+fp), (tn+fn)))
+    print('supposed to have {} negative but have {} negative'.format((tn+fp)/total, (tn+fn)/total))
+    print('supposed to have {} positive but have {} positive'.format((tp+fn)/total, (tp+fp)/total))
+    print('out of {}, we correctly classified {}'.format(len(df.index), (tp+tn)/(len(df.index))))
+    accuracyList.append((tp+tn)/(len(df.index)))
+    negList.append(tn+fn)
+    posList.append(tp+fp)
 
-def sentiment(df):
+def parentsent(parent_id, df, postdf):
+    if 't3_' in parent_id:
+        test = parent_id.replace('t3_', '')
+        parent_sent = postdf.at[test, 'sentiment']
+    else:
+        test = parent_id.replace('t1_', '')
+        try:
+            parent_sent = df.at[test, 'sentiment']
+        except:
+            parent_sent = 'neutral'
+    return parent_sent
+        
+
+def sentiment(df, postdf):
     df.insert(len(df.columns)-1, 'new sent', 'blank')
+    df.insert(len(df.columns)-1, 'w par sent', 'blank')
+
     for index in df.index:
         blob = TextBlob(df.at[index, 'body'])
         pol = blob.sentiment.polarity
+        parsent = parentsent(df.at[index, 'parent_id'], df, postdf)
         if pol > 0:
             df.at[index, 'new sent'] = 'positive'
+
+            df.at[index, 'w par sent'] = 'positive'
+
+        elif pol < 0:
+            df.at[index, 'new sent'] = 'negative'
+
+            if parsent == 'negative':
+                df.at[index, 'w par sent'] = 'positive'
+            else:
+                df.at[index, 'w par sent'] = 'negative'
+
         else:
-            df.at[index, 'new sent'] = 'negative' 
+            df.at[index, 'new sent'] = 'neutral'
+
+            if parsent == 'negative':
+                df.at[index, 'w par sent'] = 'negative'
+            else:
+                df.at[index, 'w par sent'] = 'positive'
+
     df.to_csv('sentimentized.csv', index=False)        
-    evaluation(df)
+    evaluation(df, 'new sent')
+    #evaluation(df, 'w par sent')
+
+
+def stats(df):
+    values = {}
+    for val in df['post_topic'].unique():
+        temp = df[df['post_topic']== val]
+        i = temp['sentiment'].value_counts()
+        pos = i['positive']
+        neg = i['negative']
+        neut = i['neutral']
+        total = pos+neg+neut
+        values[val] = [pos, neg, neut, total]
+    for i in values:
+        print('for topic {} we had {} total comments, {} positive, {} negative and {} neutral'.format(i, values[i][3], values[i][0], values[i][1], values[i][2]))
+
+
+
+        
+
+def nbclassify(dftest, dftrain, postdf):
+    dftrain = dftrain[['body','sentiment']]
+    tuples = [tuple(x) for x in dftrain.to_numpy()]
+    print('unique')
+    print(dftrain['sentiment'].unique())
+    cl = NaiveBayesClassifier(tuples)
+    cl.show_informative_features(10)
+
+    for index in dftest.index:
+        blob = TextBlob(dftest.at[index, 'body'], classifier=cl)
+        prob = blob.classify()
+        if prob == 'neutral':
+            print(dftest.at[index, 'body'])
+        parentid = dftest.at[index, 'parent_id']
+        parsent = parentsent(parentid, dftest, postdf)
+        if 't3_' in parentid:
+            if prob == parsent:
+                prob = 'positive'
+            elif parsent != 'neutral':
+                prob = 'negative'
+        else:
+            if prob == 'positive':
+                prob = parsent
+            else:
+                if prob == 'negative':
+                    prob = 'positive' 
+                else:
+                    prob = 'negative'
+
+        dftest.at[index, 'sentiment'] = prob
+    stats(dftest)
+
+
+def nbsentiment(dftest, dftrain):
+    dftrain = dftrain[['body','sentiment']]
+    tuples = [tuple(x) for x in dftrain.to_numpy()]
+    cl = NaiveBayesClassifier(tuples)
+    #dftest.insert(len(dftest.columns)-1, 'new sent', 'blank')
+
+    for index in dftest.index:
+        #prob = cl.classify(dftest.at[index, 'body'])
+        blob = TextBlob(dftest.at[index, 'body'], classifier=cl)
+        prob = blob.classify()
+        dftest.at[index, 'new sent'] = prob
+    dftest.to_csv('sentimentizednaivebayes.csv', index=False)   
+
+    evaluation(dftest, 'new sent')
 
 
 def main():
@@ -136,38 +272,54 @@ def main():
                      client_secret='YYVttwTqQePKNqE5RKu3kxX6mNE',
                      user_agent='APP_NAME')
     subreddit = reddit.subreddit('cscareerquestions')
-
-    #does my training data need to include some comments from each category? how do I categorize?
     
     #searches(subreddit)
 
     #this was pulling posts and creating post data grame
-
     #master_posts_df = pd.DataFrame(master_posts)
     #master_posts_df.to_csv('fullposts.csv', index=False)
 
-    #how to deal w race and queer issues
-
     #getting posts from already created CSV files
-    master_posts_df = pd.read_csv('capPostSent.csv')
+    master_posts_df = pd.read_csv('capPostSent.csv', index_col = 'id')
     master_posts_df.sort_values(by='id', inplace= True)
-
-    #when I added sentiment
-    #master_posts_df.insert(4, 'sentiment', 'blank')
-    #master_posts_df.to_csv('capPostSent.csv', index=False)
-
-    print('master posts')
-    print(master_posts_df)
 
     #pulling comments from the posts CSV, only needs to be done once
     #posts_train = master_posts_df.iloc[:19, :]
     #processcomments(reddit, posts_train)
     #master_comments_df = pd.DataFrame(master_comments)
 
-    master_comments_train_df = pd.read_csv('capstoneCommentsTrain.csv', encoding = "ISO-8859-1")
-    sentiment(master_comments_train_df)
+    comments_train_df = pd.read_csv('capstoneCommentsTrainNB.csv', index_col = 'id', encoding = "ISO-8859-1")
+    #print('OLD SENTIMENT HERE LADIES')
+    #sentiment(master_comments_train_df, master_posts_df)
+    comments_train_df = comments_train_df.sample(frac=1).reset_index(drop=True)
+    size = int(len(comments_train_df.index)/6)
+    print('GOING THROUGH NAIVE BAYES HERE LADIES')
+    for i in range(1,7): #change this back to 10 later
+        print('Fold number {}\n'.format(i))
+        if i == 1:
+            dftest = comments_train_df.iloc[:size, :]
+            dftrain = comments_train_df.iloc[size:, :]
+        elif i > 1 and i < 6:
+            last = i-1
+            dftest = comments_train_df.iloc[size*last:size*i, :]
+            dftrain1 = comments_train_df.iloc[:size*last, :]
+            dftrain2 = comments_train_df.iloc[size*i:]
+            frames = [dftrain1, dftrain2]
+            dftrain = pd.concat(frames)
+        else:
+            dftest = comments_train_df.iloc[size*5:, :]
+            dftrain = comments_train_df.iloc[:size*5, :]
+        nbsentiment(dftest, dftrain)
+   
+    print('on avrage we had {} negative posts'.format(sum(negList)/len(negList)))
+    print('on average we had {} positive posts'.format(sum(posList)/len(posList)))
+    print(' average accuracy {} '.format(sum(accuracyList)/len(accuracyList)))
 
-    print(master_comments_train_df)
+    processcomments(reddit, master_posts_df)
+    master_posts_df.to_csv('updatedPosts.csv', index=False)
+    master_comments_df = pd.DataFrame(master_comments)
+    nbclassify(master_comments_df, comments_train_df, master_posts_df)
+
 
     #master_comments_df.to_csv('capstoneCommentsTrain.csv', index=False) 
     #master_posts_df.to_csv('capstonePostsTrain.csv', index=False) 
